@@ -35,10 +35,6 @@ stages:
               workingDirectory: '$(System.DefaultWorkingDirectory)/${{ parameters.TFEnvironment }}'
               secureVarsFile: ${{ parameters.secureVarsFile }}
 
-          # - template: ./validate-steps.yaml
-          #   parameters:
-          #     workingDirectory: '$(System.DefaultWorkingDirectory)/${{ parameters.TFEnvironment }}'
-
           - task: TerraformCLI@0
             displayName: 'Run a plan for ${{ parameters.TFEnvironment }}'
             inputs:
