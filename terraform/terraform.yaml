@@ -1,1 +1,110 @@
+parameters:
+  - name: deploymentEnvironment
+    type: string
 
+  - name: terraformVersion
+    type: string
+    default: 'latest'
+
+  - name: TFEnvironment
+    type: string
+    default: ""
+
+  - name: secureVarsFile
+    type: string
+
+  - name: parallelism
+    type: number
+    default: 50
+
+  - name: tfSecFailsPipeline
+    type: boolean
+    default: false
+
+stages:
+  - stage: planStage_${{ replace(replace(parameters.TFEnvironment, '/', '_'), '-', '_') }}
+    dependsOn: []
+    displayName: "[${{ parameters.TFEnvironment }}] Plan"
+    jobs:
+      - job: planJob
+        displayName: 'Terraform plan'
+        steps:
+          - template: ./init-steps.yaml
+            parameters:
+              terraformVersion: '${{ parameters.terraformVersion }}'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/${{ parameters.TFEnvironment }}'
+              secureVarsFile: ${{ parameters.secureVarsFile }}
+
+          # - template: ./validate-steps.yaml
+          #   parameters:
+          #     workingDirectory: '$(System.DefaultWorkingDirectory)/${{ parameters.TFEnvironment }}'
+
+          - task: TerraformCLI@0
+            displayName: 'Run a plan for ${{ parameters.TFEnvironment }}'
+            inputs:
+              command: 'plan'
+              ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/main') }}:
+                commandOptions: '-input=false -parallelism=${{ parameters.parallelism }} -out=terraform.tfplan -detailed-exitcode -lock-timeout=120s -lock=true'
+              ${{ if ne(variables['Build.SourceBranch'], 'refs/heads/main') }}:
+                commandOptions: '-input=false -parallelism=${{ parameters.parallelism }} -out=terraform.tfplan -detailed-exitcode -lock-timeout=120s -lock=false'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/${{ parameters.TFEnvironment }}'
+              publishPlanResults: plan${{ replace(parameters.TFEnvironment, '/', '_') }}
+              secureVarsFile: ${{ parameters.secureVarsFile }}
+
+          - script: echo "##vso[task.setvariable variable=hasChanges;isOutput=true]$(TERRAFORM_PLAN_HAS_CHANGES)"
+            name: terraformPlanStatus
+            displayName: Record terraform plan status in stage outputs
+
+          - task: Bash@3
+            displayName: 'Clean up stuff before publishing'
+            condition: and(succeeded(), eq(variables['TERRAFORM_PLAN_HAS_CHANGES'], 'true'), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+            inputs:
+              targetType: 'inline'
+              script: 'rm -rf .terraform'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/${{ parameters.TFEnvironment }}'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Store plan as an artifact'
+            condition: and(succeeded(), eq(variables['TERRAFORM_PLAN_HAS_CHANGES'], 'true'), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+            inputs:
+              targetPath: '$(System.DefaultWorkingDirectory)'
+              artifact: terraform_${{ replace(replace(parameters.TFEnvironment, '/', '_'), '-', '_') }}_plan
+              publishLocation: 'pipeline'
+
+  - stage: applyStage_${{ replace(replace(parameters.TFEnvironment, '/', '_'), '-', '_') }}
+    displayName: "[${{ parameters.TFEnvironment }}] Apply"
+    dependsOn:
+      - planStage_${{ replace(replace(parameters.TFEnvironment, '/', '_'), '-', '_') }}
+      - tfsecStage_${{ replace(replace(parameters.TFEnvironment, '/', '_'), '-', '_') }}
+    condition: and(succeeded(), eq(variables['Build.SourceBranchName'], 'main'), eq(dependencies.planStage_${{ replace(replace(parameters.TFEnvironment, '/', '_'), '-', '_') }}.outputs['planJob.terraformPlanStatus.hasChanges'], 'true'))
+    jobs:
+      - deployment: applyJob
+        timeoutInMinutes: 180
+        displayName: 'Terraform apply'
+        environment: ${{ parameters.deploymentEnvironment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: none
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download plan'
+                  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+                  inputs:
+                    source: 'current'
+                    artifact: terraform_${{ replace(replace(parameters.TFEnvironment, '/', '_'), '-', '_') }}_plan
+                    path: $(System.DefaultWorkingDirectory)/apply/${{ parameters.TFEnvironment }}
+
+                - template: ./init-steps.yaml
+                  parameters:
+                    terraformVersion: '${{ parameters.terraformVersion }}'
+                    workingDirectory: '$(System.DefaultWorkingDirectory)/apply/${{ parameters.TFEnvironment }}/${{ parameters.TFEnvironment }}'
+                    secureVarsFile: ${{ parameters.secureVarsFile }}
+                - task: TerraformCLI@0
+                  displayName: 'Apply ${{ parameters.TFEnvironment }}'
+                  condition: and(succeeded(),  eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+                  inputs:
+                    command: 'apply'
+                    commandOptions: '-input=false -parallelism=${{ parameters.parallelism }} -auto-approve terraform.tfplan'
+                    workingDirectory: '$(System.DefaultWorkingDirectory)/apply/${{ parameters.TFEnvironment }}/${{ parameters.TFEnvironment }}'
+                    secureVarsFile: ${{ parameters.secureVarsFile }}
